@@ -40,6 +40,7 @@ Run (real mode — requires port-forwarded Prometheus):
 
 from __future__ import annotations
 import argparse
+import math
 import sys
 from datetime import datetime, timezone
 
@@ -49,7 +50,10 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
-from gate_starter import GateOrchestrator, GateConfig, ActionProposal, GateResult
+try:
+    from gate_starter import GateOrchestrator, GateConfig, ActionProposal, GateResult
+except ImportError:  # completed file saved as gate.py
+    from gate import GateOrchestrator, GateConfig, ActionProposal, GateResult
 
 
 SIMULATED_METRICS = {
@@ -79,11 +83,34 @@ class PrometheusClient:
             # data["data"]["result"] is a list of {metric: {}, value: [timestamp, "value"]}
             # Return float(data["data"]["result"][0]["value"][1])
         """
-        # TODO: implement this method
-        raise NotImplementedError("Implement PrometheusClient.query()")
+        if not HAS_REQUESTS:
+            return None
+        try:
+            response = requests.get(
+                f"{self.base_url}/api/v1/query", params={"query": promql}, timeout=5
+            )
+            response.raise_for_status()
+            data = response.json()
+        except (requests.RequestException, ValueError) as e:
+            print(f"  [prometheus] query failed: {e}", file=sys.stderr)
+            return None
+        if data.get("status") != "success":
+            print(f"  [prometheus] error: {data.get('error')}", file=sys.stderr)
+            return None
+        result = data.get("data", {}).get("result", [])
+        if not result:
+            return None
+        try:
+            value = float(result[0]["value"][1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
+        # NaN / Inf happen e.g. on 0/0 when there is no traffic
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
 
 
-# ── TODO: Implement MetricsReader ────────────────────────────────────────────
+# ── MetricsReader ────────────────────────────────────────────
 
 
 class MetricsReader:
@@ -113,11 +140,35 @@ class MetricsReader:
 
         Tip: use round(..., 4) on each value.
         """
-        # TODO: implement this method
-        raise NotImplementedError("Implement MetricsReader.read()")
+        sel = f'deployment="{self.deployment}",namespace="{self.namespace}"'
+        queries = {
+            # (promql, default if no data)
+            "memory_usage_ratio": (
+                f"max(process_memory_usage_ratio{{{sel}}})", 0.0),
+            "error_rate_ratio": (
+                f'sum(rate(http_requests_total{{{sel},status_code=~"5.."}}[2m]))'
+                f" / sum(rate(http_requests_total{{{sel}}}[2m]))", 0.0),
+            "p99_latency_ms": (
+                "histogram_quantile(0.99, sum by (le) ("
+                f"rate(http_request_duration_seconds_bucket{{{sel}}}[2m]))) * 1000", 0.0),
+            "restart_count_1h": (
+                f"sum(increase(container_restart_total{{{sel}}}[1h]))", 0.0),
+            # age of the most recent successful scrape of any payment-service target
+            "last_scrape_age_seconds": (
+                f"time() - max(timestamp(up{{{sel}}} == 1))", 9999.0),
+        }
+        metrics: dict[str, float] = {}
+        for key, (promql, default) in queries.items():
+            value = self.client.query(promql)
+            if value is None:
+                print(f"  [metrics] no data for {key} — using default {default}",
+                      file=sys.stderr)
+                value = default
+            metrics[key] = round(value, 4)
+        return metrics
 
 
-# ── TODO: Implement ConfidenceScorer ─────────────────────────────────────────
+# ── ConfidenceScorer ─────────────────────────────────────────
 
 
 class ConfidenceScorer:
@@ -178,11 +229,34 @@ class ConfidenceScorer:
         Composite:
             C = round(0.35*S + 0.25*H + 0.25*R + 0.15*F, 4)
         """
-        # TODO: implement this method
-        raise NotImplementedError("Implement ConfidenceScorer.compute()")
+        mem = metrics.get("memory_usage_ratio", 0.0)
+        if mem > 0.90:
+            S = 0.95
+        elif mem > 0.85:
+            S = 0.80
+        elif mem > 0.75:
+            S = 0.60
+        else:
+            S = 0.40
+
+        H = self.HISTORICAL_MATCH.get((symptom_class, action_id), 0.50)
+        R = self.REMEDIATION_CONFIDENCE.get(action_id, 0.50)
+
+        age = metrics.get("last_scrape_age_seconds", float("inf"))
+        if age < 30:
+            F = 0.95
+        elif age < 60:
+            F = 0.80
+        elif age < 120:
+            F = 0.65
+        else:
+            F = 0.40
+
+        C = round(0.35 * S + 0.25 * H + 0.25 * R + 0.15 * F, 4)
+        return {"S": S, "H": H, "R": R, "F": F, "C": C}
 
 
-# ── TODO: Implement symptom detection ────────────────────────────────────────
+# ── Symptom detection ────────────────────────────────────────
 
 
 def detect_symptom_class(metrics: dict[str, float]) -> str:
@@ -200,8 +274,20 @@ def detect_symptom_class(metrics: dict[str, float]) -> str:
       "MEMORY_PRESSURE", "DB_BOTTLENECK", "DEPLOYMENT_REGRESSION",
       "CAPACITY_EXHAUSTION", "UNKNOWN"
     """
-    # TODO: implement this function
-    raise NotImplementedError("Implement detect_symptom_class()")
+    mem      = metrics.get("memory_usage_ratio", 0.0)
+    p99      = metrics.get("p99_latency_ms", 0.0)
+    errors   = metrics.get("error_rate_ratio", 0.0)
+    restarts = metrics.get("restart_count_1h", 0.0)
+
+    if mem > 0.85:
+        return "MEMORY_PRESSURE"
+    if p99 > 500 and errors > 0.05:
+        return "DB_BOTTLENECK"
+    if errors > 0.10:
+        return "DEPLOYMENT_REGRESSION"
+    if restarts > 5:
+        return "CAPACITY_EXHAUSTION"
+    return "UNKNOWN"
 
 
 def symptom_to_action(symptom_class: str) -> str:

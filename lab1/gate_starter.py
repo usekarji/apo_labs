@@ -67,8 +67,13 @@ class GateConfig:
 
 class GateOrchestrator:
 
-    def __init__(self, config: GateConfig | None = None):
+    def __init__(self, config: GateConfig | None = None, clock=None):
         self.config = config or GateConfig()
+        # clock: optional callable returning an aware UTC datetime (for tests)
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def _now_utc(self) -> datetime:
+        return self._clock()
 
     def evaluate(self, proposal: ActionProposal) -> GateResult:
         blocked_by: list[str] = []
@@ -101,8 +106,11 @@ class GateOrchestrator:
         Hint: reason string should include the actual value and the threshold.
         Example: "cost $1200/hr exceeds limit $500/hr"
         """
-        # TODO: implement this gate
-        raise NotImplementedError("Implement _cost_gate()")
+        cost = proposal.estimated_cost_per_hour_usd
+        limit = self.config.cost_per_hour_usd_max
+        if cost <= limit:
+            return True, f"cost ${cost:,.0f}/hr within limit ${limit:,.0f}/hr"
+        return False, f"cost ${cost:,.0f}/hr exceeds limit ${limit:,.0f}/hr"
 
     def _blast_radius_gate(self, proposal: ActionProposal) -> tuple[bool, str]:
         """
@@ -111,8 +119,11 @@ class GateOrchestrator:
 
         Example: "blast radius 15% exceeds limit 10%"
         """
-        # TODO: implement this gate
-        raise NotImplementedError("Implement _blast_radius_gate()")
+        radius = proposal.blast_radius_fraction
+        limit = self.config.blast_radius_max
+        if radius <= limit:
+            return True, f"blast radius {radius:.0%} within limit {limit:.0%}"
+        return False, f"blast radius {radius:.0%} exceeds limit {limit:.0%}"
 
     def _reversibility_gate(self, proposal: ActionProposal) -> tuple[bool, str]:
         """
@@ -121,8 +132,11 @@ class GateOrchestrator:
 
         Example: "reversal time 900s exceeds limit 600s"
         """
-        # TODO: implement this gate
-        raise NotImplementedError("Implement _reversibility_gate()")
+        rt = proposal.reversal_time_seconds
+        limit = self.config.reversal_time_sec_max
+        if rt <= limit:
+            return True, f"reversal time {rt}s within limit {limit}s"
+        return False, f"reversal time {rt}s exceeds limit {limit}s"
 
     def _time_gate(self, proposal: ActionProposal) -> tuple[bool, str]:
         """
@@ -136,8 +150,12 @@ class GateOrchestrator:
 
         Tip: use datetime.now(timezone.utc).hour to get the current hour.
         """
-        # TODO: implement this gate
-        raise NotImplementedError("Implement _time_gate()")
+        start, end = self.config.peak_hours_utc
+        hour = self._now_utc().hour
+        window = f"{start:02d}:00–{end:02d}:00 UTC"
+        if start <= hour < end:
+            return False, f"action blocked during peak hours ({window})"
+        return True, f"current hour {hour:02d}:00 UTC outside peak hours ({window})"
 
 
 # ── Test harness ──────────────────────────────────────────────────────────────
